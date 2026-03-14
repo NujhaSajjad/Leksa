@@ -6,7 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import logging
-
+from dotenv import load_dotenv
+load_dotenv()
 from document_parser import parse_document
 from lecture_planner import generate_lecture_script
 from live_session import LiveSessionManager

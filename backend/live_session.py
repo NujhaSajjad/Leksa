@@ -1,3 +1,265 @@
+# import os
+# import asyncio
+# import json
+# import logging
+# import base64
+# from fastapi import WebSocket
+# from google import genai
+# from google.genai import types
+
+# logger = logging.getLogger(__name__)
+
+# GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY")
+# LIVE_MODEL      = "gemini-2.0-flash-live-001"
+# SAMPLE_RATE     = 24000   # Gemini Live output sample rate (Hz)
+# CHUNK_SIZE      = 1024    # audio bytes per chunk
+
+
+# class LiveSessionManager:
+#     """
+#     Frontend WebSocket  ↔  Gemini Live API bridge.
+
+#     Frontend se messages:
+#         { "type": "audio",    "data": "<base64 PCM>" }   # mic audio
+#         { "type": "next" }                                # next segment jao
+#         { "type": "pause" }                               # pause karo
+#         { "type": "resume" }                              # resume karo
+#         { "type": "end" }                                 # session khatam karo
+
+#     Frontend ko messages:
+#         { "type": "audio",       "data": "<base64 PCM>" }  # AI voice
+#         { "type": "transcript",  "text": "..." }            # AI ka text
+#         { "type": "segment",     "index": 0, "title": "..." }
+#         { "type": "status",      "status": "speaking"|"listening"|"idle" }
+#         { "type": "done" }                                  # lecture khatam
+#         { "type": "error",       "message": "..." }
+#     """
+
+#     def __init__(self, session_id: str, session_data: dict, websocket: WebSocket, db):
+#         self.session_id   = session_id
+#         self.session_data = session_data
+#         self.websocket    = websocket
+#         self.db           = db
+
+#         self.segments        = session_data.get("segments", [])
+#         self.current_index   = session_data.get("current_segment", 0)
+#         self.total_segments  = len(self.segments)
+
+#         self.gemini_session  = None
+#         self.client          = None
+#         self._running        = False
+
+#     # ─── Main run loop ────────────────────────────
+#     async def run(self):
+#         if not GEMINI_API_KEY:
+#             await self._send({"type": "error", "message": "GEMINI_API_KEY missing."})
+#             return
+
+#         if not self.segments:
+#             await self._send({"type": "error", "message": "No segments found."})
+#             return
+
+#         self.client  = genai.Client(api_key=GEMINI_API_KEY)
+#         self._running = True
+
+#         # System prompt — teacher persona + full lecture plan
+#         system_prompt = self._build_system_prompt()
+
+#         config = types.LiveConnectConfig(
+#             response_modalities=["AUDIO"],
+#             system_instruction=system_prompt,
+#             speech_config=types.SpeechConfig(
+#                 voice_config=types.VoiceConfig(
+#                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
+#                         voice_name="Charon"   # natural, clear voice
+#                     )
+#                 )
+#             ),
+#         )
+
+#         logger.info(f"Connecting to Gemini Live: session={self.session_id}")
+
+#         async with self.client.aio.live.connect(
+#             model=LIVE_MODEL, config=config
+#         ) as session:
+#             self.gemini_session = session
+
+#             # Pehla segment shuru karo
+#             await self._start_segment(self.current_index)
+
+#             # Frontend aur Gemini se messages parallel handle karo
+#             await asyncio.gather(
+#                 self._receive_from_frontend(),
+#                 self._receive_from_gemini(),
+#             )
+
+#     # ─── System prompt ────────────────────────────
+#     def _build_system_prompt(self) -> str:
+#         segments_summary = "\n".join(
+#             f"  Segment {s['index']+1}: {s['title']}" for s in self.segments
+#         )
+
+#         return f"""You are Leksa, an expert AI teacher. Your job is to teach the student the content from their uploaded document through natural spoken conversation.
+
+# LECTURE PLAN ({self.total_segments} segments):
+# {segments_summary}
+
+# TEACHING RULES:
+# 1. Speak naturally and conversationally — like a real teacher, not a robot reading text.
+# 2. When the student interrupts or asks a question, STOP immediately and answer them clearly.
+# 3. After answering, say "Now, where were we..." and continue from where you left off.
+# 4. Keep your tone warm, encouraging, and patient.
+# 5. If the student seems confused, re-explain using a simpler analogy or example.
+# 6. After each segment, ask the comprehension question naturally.
+# 7. Wait for the student's response before moving to the next segment.
+# 8. If the student says "next", "continue", or "aage", move to the next segment.
+
+# IMPORTANT: You will receive the content of each segment one at a time. Focus only on teaching that segment before moving forward.
+# """
+
+#     # ─── Start a segment ──────────────────────────
+#     async def _start_segment(self, index: int):
+#         if index >= self.total_segments:
+#             await self._send({"type": "done"})
+#             await self._send({"type": "status", "status": "idle"})
+#             return
+
+#         seg = self.segments[index]
+#         logger.info(f"Starting segment {index+1}/{self.total_segments}: {seg['title']}")
+
+#         # Frontend ko segment info bhejo
+#         await self._send({
+#             "type":   "segment",
+#             "index":  index,
+#             "title":  seg["title"],
+#             "key_points": seg.get("key_points", []),
+#         })
+#         await self._send({"type": "status", "status": "speaking"})
+
+#         # Gemini ko is segment ka content do aur bolne kaho
+#         teaching_prompt = f"""
+# Now teach Segment {index+1}: "{seg['title']}"
+
+# Content to teach:
+# {seg['content']}
+
+# Key points to cover:
+# {chr(10).join(f"- {kp}" for kp in seg.get("key_points", []))}
+
+# After finishing this explanation, ask this question naturally:
+# "{seg.get('comprehension_question', 'Kya ye samajh aaya?')}"
+# """
+#         await self.gemini_session.send(
+#             input=teaching_prompt,
+#             end_of_turn=True,
+#         )
+
+#         # Firestore mein current segment update karo
+#         await self.db.update_session(self.session_id, {
+#             "current_segment": index,
+#             "status": "active",
+#         })
+#         self.current_index = index
+
+#     # ─── Receive from frontend ────────────────────
+#     async def _receive_from_frontend(self):
+#         try:
+#             while self._running:
+#                 raw = await self.websocket.receive_text()
+#                 msg = json.loads(raw)
+#                 msg_type = msg.get("type")
+
+#                 if msg_type == "audio":
+#                     # User ka mic audio → Gemini ko bhejo (barge-in handle hoga automatically)
+#                     audio_bytes = base64.b64decode(msg["data"])
+#                     await self.gemini_session.send(
+#                         input=types.LiveClientRealtimeInput(
+#                             media_chunks=[
+#                                 types.Blob(
+#                                     data=audio_bytes,
+#                                     mime_type=f"audio/pcm;rate={SAMPLE_RATE}",
+#                                 )
+#                             ]
+#                         )
+#                     )
+#                     await self._send({"type": "status", "status": "listening"})
+
+#                 elif msg_type == "next":
+#                     # User ne next segment manga
+#                     await self._start_segment(self.current_index + 1)
+
+#                 elif msg_type == "pause":
+#                     await self._send({"type": "status", "status": "idle"})
+
+#                 elif msg_type == "resume":
+#                     await self.gemini_session.send(
+#                         input="Please continue the lecture from where you left off.",
+#                         end_of_turn=True,
+#                     )
+#                     await self._send({"type": "status", "status": "speaking"})
+
+#                 elif msg_type == "end":
+#                     self._running = False
+#                     break
+
+#         except Exception as e:
+#             logger.error(f"Frontend receive error: {e}")
+#             self._running = False
+
+#     # ─── Receive from Gemini ──────────────────────
+#     async def _receive_from_gemini(self):
+#         try:
+#             while self._running:
+#                 async for response in self.gemini_session.receive():
+
+#                     # Audio data → frontend ko bhejo
+#                     if (
+#                         hasattr(response, "data")
+#                         and response.data
+#                     ):
+#                         audio_b64 = base64.b64encode(response.data).decode("utf-8")
+#                         await self._send({"type": "audio", "data": audio_b64})
+#                         await self._send({"type": "status", "status": "speaking"})
+
+#                     # Text transcript → frontend ko bhejo
+#                     if (
+#                         hasattr(response, "text")
+#                         and response.text
+#                     ):
+#                         await self._send({"type": "transcript", "text": response.text})
+
+#                     # Turn complete → listening state
+#                     if (
+#                         hasattr(response, "server_content")
+#                         and response.server_content
+#                         and hasattr(response.server_content, "turn_complete")
+#                         and response.server_content.turn_complete
+#                     ):
+#                         await self._send({"type": "status", "status": "listening"})
+
+#         except Exception as e:
+#             logger.error(f"Gemini receive error: {e}")
+#             self._running = False
+
+#     # ─── Helpers ──────────────────────────────────
+#     async def _send(self, data: dict):
+#         try:
+#             await self.websocket.send_json(data)
+#         except Exception as e:
+#             logger.warning(f"Send error: {e}")
+
+#     async def cleanup(self):
+#         self._running = False
+#         try:
+#             await self.db.update_session(self.session_id, {"status": "ended"})
+#         except:
+#             pass
+#         logger.info(f"Session cleaned up: {self.session_id}")
+
+
+
+
+
 import os
 import asyncio
 import json
@@ -10,29 +272,13 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY")
-LIVE_MODEL      = "gemini-2.0-flash-live-001"
+LIVE_MODEL      = "models/gemini-2.0-flash-live-001"
 SAMPLE_RATE     = 24000   # Gemini Live output sample rate (Hz)
-CHUNK_SIZE      = 1024    # audio bytes per chunk
-
 
 class LiveSessionManager:
     """
-    Frontend WebSocket  ↔  Gemini Live API bridge.
-
-    Frontend se messages:
-        { "type": "audio",    "data": "<base64 PCM>" }   # mic audio
-        { "type": "next" }                                # next segment jao
-        { "type": "pause" }                               # pause karo
-        { "type": "resume" }                              # resume karo
-        { "type": "end" }                                 # session khatam karo
-
-    Frontend ko messages:
-        { "type": "audio",       "data": "<base64 PCM>" }  # AI voice
-        { "type": "transcript",  "text": "..." }            # AI ka text
-        { "type": "segment",     "index": 0, "title": "..." }
-        { "type": "status",      "status": "speaking"|"listening"|"idle" }
-        { "type": "done" }                                  # lecture khatam
-        { "type": "error",       "message": "..." }
+    Frontend WebSocket ↔ Gemini Live API bridge.
+    Handles Teacher Persona, Interruptions (Barge-in), and Lecture Flow.
     """
 
     def __init__(self, session_id: str, session_data: dict, websocket: WebSocket, db):
@@ -49,29 +295,27 @@ class LiveSessionManager:
         self.client          = None
         self._running        = False
 
-    # ─── Main run loop ────────────────────────────
     async def run(self):
         if not GEMINI_API_KEY:
             await self._send({"type": "error", "message": "GEMINI_API_KEY missing."})
             return
 
-        if not self.segments:
-            await self._send({"type": "error", "message": "No segments found."})
-            return
-
-        self.client  = genai.Client(api_key=GEMINI_API_KEY)
+       # self.client = genai.Client(api_key=GEMINI_API_KEY, http_options={'api_version': 'v1alpha'})
+        self.client = genai.Client(api_key=GEMINI_API_KEY)
         self._running = True
 
-        # System prompt — teacher persona + full lecture plan
         system_prompt = self._build_system_prompt()
 
+        # FIXED: system_instruction must be a types.Content object
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
-            system_instruction=system_prompt,
+            system_instruction=types.Content(
+                parts=[types.Part(text=system_prompt)]
+            ),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"   # natural, clear voice
+                        voice_name="Charon" 
                     )
                 )
             ),
@@ -79,89 +323,65 @@ class LiveSessionManager:
 
         logger.info(f"Connecting to Gemini Live: session={self.session_id}")
 
-        async with self.client.aio.live.connect(
-            model=LIVE_MODEL, config=config
-        ) as session:
-            self.gemini_session = session
+        try:
+            async with self.client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+                self.gemini_session = session
 
-            # Pehla segment shuru karo
-            await self._start_segment(self.current_index)
+                # Start the first segment
+                await self._start_segment(self.current_index)
 
-            # Frontend aur Gemini se messages parallel handle karo
-            await asyncio.gather(
-                self._receive_from_frontend(),
-                self._receive_from_gemini(),
-            )
+                # Parallel loops for Frontend and Gemini
+                await asyncio.gather(
+                    self._receive_from_frontend(),
+                    self._receive_from_gemini(),
+                )
+        except Exception as e:
+            logger.error(f"Gemini Connection Error: {e}")
+            await self._send({"type": "error", "message": f"Connection failed: {str(e)}"})
 
-    # ─── System prompt ────────────────────────────
     def _build_system_prompt(self) -> str:
         segments_summary = "\n".join(
-            f"  Segment {s['index']+1}: {s['title']}" for s in self.segments
+            f" - Segment {s['index']+1}: {s['title']}" for s in self.segments
         )
 
-        return f"""You are Leksa, an expert AI teacher. Your job is to teach the student the content from their uploaded document through natural spoken conversation.
+        return f"""
+        PERSONALITY:
+        You are Leksa, a friendly and brilliant AI Teacher. Your voice is natural and expressive.
+        You are conducting a live 1-on-1 session based on a student's uploaded document.
 
-LECTURE PLAN ({self.total_segments} segments):
-{segments_summary}
+        LECTURE PLAN:
+        {segments_summary}
 
-TEACHING RULES:
-1. Speak naturally and conversationally — like a real teacher, not a robot reading text.
-2. When the student interrupts or asks a question, STOP immediately and answer them clearly.
-3. After answering, say "Now, where were we..." and continue from where you left off.
-4. Keep your tone warm, encouraging, and patient.
-5. If the student seems confused, re-explain using a simpler analogy or example.
-6. After each segment, ask the comprehension question naturally.
-7. Wait for the student's response before moving to the next segment.
-8. If the student says "next", "continue", or "aage", move to the next segment.
+        CORE RULES:
+        1. NATURAL TEACHING: Explain like a real person. Use analogies. Don't just read text.
+        2. BARGE-IN: If the student speaks, STOP immediately. Listen, answer, then resume.
+        3. FLOW: After each segment, ask "Samajh aaya?" or "Should we move on?". 
+        4. WAIT: Don't start the next segment until the student acknowledges or says "next".
+        """
 
-IMPORTANT: You will receive the content of each segment one at a time. Focus only on teaching that segment before moving forward.
-"""
-
-    # ─── Start a segment ──────────────────────────
     async def _start_segment(self, index: int):
         if index >= self.total_segments:
             await self._send({"type": "done"})
-            await self._send({"type": "status", "status": "idle"})
             return
 
         seg = self.segments[index]
-        logger.info(f"Starting segment {index+1}/{self.total_segments}: {seg['title']}")
+        logger.info(f"Leksa teaching segment {index+1}: {seg['title']}")
 
-        # Frontend ko segment info bhejo
         await self._send({
-            "type":   "segment",
-            "index":  index,
-            "title":  seg["title"],
-            "key_points": seg.get("key_points", []),
+            "type": "segment",
+            "index": index,
+            "title": seg["title"],
+            "key_points": seg.get("key_points", [])
         })
-        await self._send({"type": "status", "status": "speaking"})
 
-        # Gemini ko is segment ka content do aur bolne kaho
-        teaching_prompt = f"""
-Now teach Segment {index+1}: "{seg['title']}"
-
-Content to teach:
-{seg['content']}
-
-Key points to cover:
-{chr(10).join(f"- {kp}" for kp in seg.get("key_points", []))}
-
-After finishing this explanation, ask this question naturally:
-"{seg.get('comprehension_question', 'Kya ye samajh aaya?')}"
-"""
-        await self.gemini_session.send(
-            input=teaching_prompt,
-            end_of_turn=True,
-        )
-
-        # Firestore mein current segment update karo
-        await self.db.update_session(self.session_id, {
-            "current_segment": index,
-            "status": "active",
-        })
+        # FIXED: Sending instruction as a list of parts/strings
+        instruction = f"Now teach Segment {index+1}: {seg['title']}. Content to cover: {seg['content']}. Then ask: {seg.get('comprehension_question')}"
+        
+        await self.gemini_session.send(input=instruction, end_of_turn=True)
+        
+        await self.db.update_session(self.session_id, {"current_segment": index, "status": "active"})
         self.current_index = index
 
-    # ─── Receive from frontend ────────────────────
     async def _receive_from_frontend(self):
         try:
             while self._running:
@@ -170,88 +390,50 @@ After finishing this explanation, ask this question naturally:
                 msg_type = msg.get("type")
 
                 if msg_type == "audio":
-                    # User ka mic audio → Gemini ko bhejo (barge-in handle hoga automatically)
                     audio_bytes = base64.b64decode(msg["data"])
                     await self.gemini_session.send(
                         input=types.LiveClientRealtimeInput(
-                            media_chunks=[
-                                types.Blob(
-                                    data=audio_bytes,
-                                    mime_type=f"audio/pcm;rate={SAMPLE_RATE}",
-                                )
-                            ]
+                            media_chunks=[types.Blob(data=audio_bytes, mime_type="audio/pcm;rate=24000")]
                         )
                     )
-                    await self._send({"type": "status", "status": "listening"})
-
                 elif msg_type == "next":
-                    # User ne next segment manga
                     await self._start_segment(self.current_index + 1)
-
-                elif msg_type == "pause":
-                    await self._send({"type": "status", "status": "idle"})
-
-                elif msg_type == "resume":
-                    await self.gemini_session.send(
-                        input="Please continue the lecture from where you left off.",
-                        end_of_turn=True,
-                    )
-                    await self._send({"type": "status", "status": "speaking"})
-
                 elif msg_type == "end":
                     self._running = False
                     break
-
         except Exception as e:
-            logger.error(f"Frontend receive error: {e}")
+            logger.error(f"Frontend error: {e}")
             self._running = False
 
-    # ─── Receive from Gemini ──────────────────────
     async def _receive_from_gemini(self):
         try:
             while self._running:
                 async for response in self.gemini_session.receive():
-
-                    # Audio data → frontend ko bhejo
-                    if (
-                        hasattr(response, "data")
-                        and response.data
-                    ):
+                    # Handle Audio
+                    if response.data:
                         audio_b64 = base64.b64encode(response.data).decode("utf-8")
                         await self._send({"type": "audio", "data": audio_b64})
                         await self._send({"type": "status", "status": "speaking"})
 
-                    # Text transcript → frontend ko bhejo
-                    if (
-                        hasattr(response, "text")
-                        and response.text
-                    ):
+                    # Handle Text Transcript
+                    if response.text:
                         await self._send({"type": "transcript", "text": response.text})
 
-                    # Turn complete → listening state
-                    if (
-                        hasattr(response, "server_content")
-                        and response.server_content
-                        and hasattr(response.server_content, "turn_complete")
-                        and response.server_content.turn_complete
-                    ):
+                    # Handle Turn Complete
+                    if response.server_content and response.server_content.turn_complete:
                         await self._send({"type": "status", "status": "listening"})
 
         except Exception as e:
-            logger.error(f"Gemini receive error: {e}")
+            logger.error(f"Gemini stream error: {e}")
             self._running = False
 
-    # ─── Helpers ──────────────────────────────────
     async def _send(self, data: dict):
         try:
             await self.websocket.send_json(data)
-        except Exception as e:
-            logger.warning(f"Send error: {e}")
+        except:
+            pass
 
     async def cleanup(self):
         self._running = False
-        try:
-            await self.db.update_session(self.session_id, {"status": "ended"})
-        except:
-            pass
+        await self.db.update_session(self.session_id, {"status": "ended"})
         logger.info(f"Session cleaned up: {self.session_id}")
