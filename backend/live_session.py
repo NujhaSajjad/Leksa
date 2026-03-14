@@ -258,8 +258,6 @@
 
 
 
-
-
 import os
 import asyncio
 import json
@@ -271,118 +269,91 @@ from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY")
-LIVE_MODEL      = "models/gemini-2.0-flash-live-001"
-SAMPLE_RATE     = 24000   # Gemini Live output sample rate (Hz)
-
+# Environment Variables
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Native Audio Preview Model (Experimental)
+LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 class LiveSessionManager:
     """
-    Frontend WebSocket ↔ Gemini Live API bridge.
-    Handles Teacher Persona, Interruptions (Barge-in), and Lecture Flow.
+    Leksa Native Audio Manager.
+    Directly feeds document context into the live multimodal stream.
     """
 
     def __init__(self, session_id: str, session_data: dict, websocket: WebSocket, db):
-        self.session_id   = session_id
-        self.session_data = session_data
-        self.websocket    = websocket
-        self.db           = db
+        self.session_id = session_id
+        self.session_data = session_data  # Is mein ab poora 'extracted_text' hoga
+        self.websocket = websocket
+        self.db = db
 
-        self.segments        = session_data.get("segments", [])
-        self.current_index   = session_data.get("current_segment", 0)
-        self.total_segments  = len(self.segments)
-
-        self.gemini_session  = None
-        self.client          = None
-        self._running        = False
+        self.client = None
+        self.gemini_session = None
+        self._running = False
 
     async def run(self):
         if not GEMINI_API_KEY:
-            await self._send({"type": "error", "message": "GEMINI_API_KEY missing."})
+            await self._send({"type": "error", "message": "API Key missing!"})
             return
 
-       # self.client = genai.Client(api_key=GEMINI_API_KEY, http_options={'api_version': 'v1alpha'})
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        # Initialize Client without explicit version to avoid 1008 errors
+        self.client = genai.Client(api_key=GEMINI_API_KEY, http_options={'api_version': 'v1alpha'})
         self._running = True
 
-        system_prompt = self._build_system_prompt()
+        # System Instruction: Leksa as a Native Audio Teacher
+        # Hum poora document yahan context mein bhej rahe hain
+        doc_text = self.session_data.get("extracted_text", "No document content found.")
+        
+        system_prompt = f"""
+        You are Leksa, an expert AI Teacher. 
+        You have NATIVE AUDIO capabilities. You can hear emotions and speak naturally.
+        
+        CONTEXT DOCUMENT:
+        {doc_text[:15000]} 
 
-        # FIXED: system_instruction must be a types.Content object
+        INSTRUCTIONS:
+        1. Start by greeting the student and briefly mentioning what the document is about.
+        2. Teach the document topic by topic.
+        3. Since you are in a LIVE session, keep your explanations concise (30-45 seconds max at a time).
+        4. After every explanation, ask a follow-up question to ensure the student is following.
+        5. If the student interrupts, stop and answer their query.
+        6. Use a warm, friendly tone. You can use occasional filler words like 'Right?' or 'Theek hai?' to sound human.
+        """
+
         config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
+            response_modalities=["AUDIO"], # Forces Native Audio output
             system_instruction=types.Content(
                 parts=[types.Part(text=system_prompt)]
             ),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon" 
+                        voice_name="Charon" # Best voice for teaching persona
                     )
                 )
             ),
         )
 
-        logger.info(f"Connecting to Gemini Live: session={self.session_id}")
+        logger.info(f"Starting Native Audio Session: {self.session_id}")
 
         try:
             async with self.client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
                 self.gemini_session = session
+                
+                # Initial trigger to start the conversation
+                await self.gemini_session.send(input="Hello Leksa, I am ready to learn. Please start the lesson.", end_of_turn=True)
 
-                # Start the first segment
-                await self._start_segment(self.current_index)
-
-                # Parallel loops for Frontend and Gemini
+                # Parallel processing for Frontend and Gemini
                 await asyncio.gather(
                     self._receive_from_frontend(),
                     self._receive_from_gemini(),
                 )
         except Exception as e:
-            logger.error(f"Gemini Connection Error: {e}")
-            await self._send({"type": "error", "message": f"Connection failed: {str(e)}"})
-
-    def _build_system_prompt(self) -> str:
-        segments_summary = "\n".join(
-            f" - Segment {s['index']+1}: {s['title']}" for s in self.segments
-        )
-
-        return f"""
-        PERSONALITY:
-        You are Leksa, a friendly and brilliant AI Teacher. Your voice is natural and expressive.
-        You are conducting a live 1-on-1 session based on a student's uploaded document.
-
-        LECTURE PLAN:
-        {segments_summary}
-
-        CORE RULES:
-        1. NATURAL TEACHING: Explain like a real person. Use analogies. Don't just read text.
-        2. BARGE-IN: If the student speaks, STOP immediately. Listen, answer, then resume.
-        3. FLOW: After each segment, ask "Samajh aaya?" or "Should we move on?". 
-        4. WAIT: Don't start the next segment until the student acknowledges or says "next".
-        """
-
-    async def _start_segment(self, index: int):
-        if index >= self.total_segments:
-            await self._send({"type": "done"})
-            return
-
-        seg = self.segments[index]
-        logger.info(f"Leksa teaching segment {index+1}: {seg['title']}")
-
-        await self._send({
-            "type": "segment",
-            "index": index,
-            "title": seg["title"],
-            "key_points": seg.get("key_points", [])
-        })
-
-        # FIXED: Sending instruction as a list of parts/strings
-        instruction = f"Now teach Segment {index+1}: {seg['title']}. Content to cover: {seg['content']}. Then ask: {seg.get('comprehension_question')}"
-        
-        await self.gemini_session.send(input=instruction, end_of_turn=True)
-        
-        await self.db.update_session(self.session_id, {"current_segment": index, "status": "active"})
-        self.current_index = index
+            logger.error(f"Native Audio Connection Error: {e}")
+            await self._send({"type": "error", "message": str(e)})
+        finally:
+            await self.cleanup()
 
     async def _receive_from_frontend(self):
+        """Receive Mic audio or Text commands from user's browser."""
         try:
             while self._running:
                 raw = await self.websocket.receive_text()
@@ -390,41 +361,38 @@ class LiveSessionManager:
                 msg_type = msg.get("type")
 
                 if msg_type == "audio":
-                    audio_bytes = base64.b64decode(msg["data"])
+                    # Raw PCM 16-bit 24kHz audio from frontend
+                    audio_data = base64.b64decode(msg["data"])
                     await self.gemini_session.send(
                         input=types.LiveClientRealtimeInput(
-                            media_chunks=[types.Blob(data=audio_bytes, mime_type="audio/pcm;rate=24000")]
+                            media_chunks=[types.Blob(data=audio_data, mime_type="audio/pcm;rate=24000")]
                         )
                     )
-                elif msg_type == "next":
-                    await self._start_segment(self.current_index + 1)
                 elif msg_type == "end":
                     self._running = False
-                    break
         except Exception as e:
-            logger.error(f"Frontend error: {e}")
+            logger.error(f"Frontend bridge error: {e}")
             self._running = False
 
     async def _receive_from_gemini(self):
+        """Handle Native Audio and Transcripts coming FROM Gemini."""
         try:
             while self._running:
                 async for response in self.gemini_session.receive():
-                    # Handle Audio
+                    # 1. Native Audio Chunk
                     if response.data:
                         audio_b64 = base64.b64encode(response.data).decode("utf-8")
                         await self._send({"type": "audio", "data": audio_b64})
-                        await self._send({"type": "status", "status": "speaking"})
 
-                    # Handle Text Transcript
+                    # 2. Text Transcript (for UI captions)
                     if response.text:
                         await self._send({"type": "transcript", "text": response.text})
 
-                    # Handle Turn Complete
+                    # 3. Server Status
                     if response.server_content and response.server_content.turn_complete:
                         await self._send({"type": "status", "status": "listening"})
-
         except Exception as e:
-            logger.error(f"Gemini stream error: {e}")
+            logger.error(f"Gemini Native stream error: {e}")
             self._running = False
 
     async def _send(self, data: dict):
@@ -435,5 +403,6 @@ class LiveSessionManager:
 
     async def cleanup(self):
         self._running = False
-        await self.db.update_session(self.session_id, {"status": "ended"})
-        logger.info(f"Session cleaned up: {self.session_id}")
+        if self.db:
+            await self.db.update_session(self.session_id, {"status": "completed"})
+        logger.info(f"Native Session {self.session_id} ended.")
