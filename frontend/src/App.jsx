@@ -291,22 +291,14 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
       const { MicVAD } = await import("@ricky0123/vad-web");
 
       const vad = await MicVAD.new({
-        // ── Thresholds ────────────────────────────────────────────────────
-        positiveSpeechThreshold: 0.85, // is se upar = voice confirmed
-        negativeSpeechThreshold: 0.35, // is se neeche = silence confirmed
-        minSpeechFrames: 3,            // itne frames ke baad hi "speech start" maano
-        preSpeechPadFrames: 5,         // speech se pehle ke frames bhi bhejo (word cut-off rokta hai)
-        redemptionFrames: 8,           // short pause ke baad bhi thoda wait karo
+        positiveSpeechThreshold: 0.60,  // 0.85 → 0.60 (easier to detect)
+        negativeSpeechThreshold: 0.20,  // 0.35 → 0.20
+        minSpeechFrames: 2,             // 3 → 2
+        preSpeechPadFrames: 8,          // 5 → 8 (word cut-off nahi hoga)
+        redemptionFrames: 10,           // 8 → 10
 
         onSpeechStart: () => {
           setUserSpeaking(true);
-
-          // Gemini ko interrupt signal bhejo
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: "interrupt" }));
-          }
-
-          // Local audio mute
           if (geminiGainRef.current) {
             geminiGainRef.current.gain.setTargetAtTime(
               0, audioCtxRef.current.currentTime, 0.015
@@ -316,12 +308,9 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
           nextStartTimeRef.current = 0;
         },
 
-        // har frame real-time mein check hota hai
         onFrameProcessed: (probabilities, frame) => {
-          if (
-            probabilities.isSpeech > 0.5 &&
-            ws.readyState === WebSocket.OPEN
-          ) {
+          // ← threshold hatao, SADA audio bhejte raho Gemini ko
+          if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "audio", data: toPCM16b64(frame) }));
           }
         },
@@ -333,9 +322,13 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
               1.0, audioCtxRef.current.currentTime, 0.05
             );
           }
+          // ← YE ADD KARO — Gemini ko batao user ruk gaya
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "turn_end" }));
+          }
         },
+
         onVADMisfire: () => {
-          // bahut choti noise thi — restore gain and ignore
           setUserSpeaking(false);
           if (geminiGainRef.current) {
             geminiGainRef.current.gain.setTargetAtTime(
