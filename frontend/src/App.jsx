@@ -73,9 +73,9 @@ function Waveform({ playing }) {
         const env = Math.sin(p * Math.PI) ** 1.1;
         const amp = isPlaying
           ? env *
-            H *
-            0.3 *
-            (0.55 + 0.45 * Math.sin(p * Math.PI * 3 + t.current * 0.9))
+          H *
+          0.3 *
+          (0.55 + 0.45 * Math.sin(p * Math.PI * 3 + t.current * 0.9))
           : H * 0.018;
         return [
           p * W,
@@ -215,7 +215,7 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
       }
     };
 
-    ws.onerror = () => setError("Connection error. Backend chal raha hai?");
+    ws.onerror = () => setError("Connection error. is backend  on?");
     ws.onclose = () => {
       setStatus("idle");
       setPlaying(false);
@@ -224,51 +224,52 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
     return () => {
       try {
         ws.send(JSON.stringify({ type: "end" }));
-      } catch {}
+      } catch { }
       ws.close();
       stopMic();
     };
   }, [sessionId]);
 
   // ── Audio playback (PCM 24kHz mono) ──────────
+  // ── Scheduled gapless playback ─────────────────
+  const nextStartTimeRef = useRef(0);
+
   const getAudioCtx = () => {
     if (!audioCtxRef.current) {
-      audioCtxRef.current = new (
-        window.AudioContext || window.webkitAudioContext
-      )({ sampleRate: 24000 });
-      // Create a master GainNode for Gemini audio so we can instantly mute
-      // it when the user starts speaking (local barge-in mute).
+      audioCtxRef.current = new (window.AudioContext || window.AudioContext)(
+        { sampleRate: 24000 }
+      );
       const gain = audioCtxRef.current.createGain();
       gain.gain.value = 1.0;
       gain.connect(audioCtxRef.current.destination);
       geminiGainRef.current = gain;
+      nextStartTimeRef.current = 0; // reset
     }
     return audioCtxRef.current;
   };
 
-  const drainAudioQueue = async () => {
-    if (isPlayingARef.current || audioQueueRef.current.length === 0) return;
-    isPlayingARef.current = true;
+  const drainAudioQueue = () => {
+    // Sab queued chunks ek hi loop mein scheduled kar do — no await, no gaps
+    const ctx = getAudioCtx();
     while (audioQueueRef.current.length > 0) {
       const buf = audioQueueRef.current.shift();
-      const ctx = getAudioCtx();
       const int16 = new Int16Array(buf);
       const f32 = new Float32Array(int16.length);
       for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
+
       const ab = ctx.createBuffer(1, f32.length, 24000);
       ab.copyToChannel(f32, 0);
-      await new Promise((resolve) => {
-        const src = ctx.createBufferSource();
-        src.buffer = ab;
-        // Route through GainNode so we can duck it on barge-in
-        src.connect(geminiGainRef.current || ctx.destination);
-        src.onended = resolve;
-        src.start();
-      });
-    }
-    isPlayingARef.current = false;
-  };
 
+      const src = ctx.createBufferSource();
+      src.buffer = ab;
+      src.connect(geminiGainRef.current || ctx.destination);
+
+      // Schedule immediately after previous chunk — zero gap
+      const startAt = Math.max(ctx.currentTime, nextStartTimeRef.current);
+      src.start(startAt);
+      nextStartTimeRef.current = startAt + ab.duration;
+    }
+  };
   // ── Float32 → PCM16 → base64 helper ──────────
   const toPCM16b64 = (float32) => {
     const i16 = new Int16Array(float32.length);
@@ -299,17 +300,20 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
 
         onSpeechStart: () => {
           setUserSpeaking(true);
-          // ── Local barge-in mute ───────────────────────────────────────
-          // Instantly duck Gemini audio output to 0 the moment VAD detects
-          // user voice — no round-trip needed. Creates seamless interruption feel.
+
+          // Gemini ko interrupt signal bhejo
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "interrupt" }));
+          }
+
+          // Local audio mute
           if (geminiGainRef.current) {
             geminiGainRef.current.gain.setTargetAtTime(
               0, audioCtxRef.current.currentTime, 0.015
             );
           }
-          // Flush the queue so stale Gemini audio chunks don't play later
           audioQueueRef.current = [];
-          isPlayingARef.current = false;
+          nextStartTimeRef.current = 0;
         },
 
         // har frame real-time mein check hota hai
@@ -322,21 +326,14 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
           }
         },
 
-        onSpeechEnd: (audioFloat32) => {
-          // user ruk gaya — poora utterance ek baar aur bhejo (safety net)
+        onSpeechEnd: () => {
           setUserSpeaking(false);
-          // Restore Gemini audio output gain
           if (geminiGainRef.current) {
             geminiGainRef.current.gain.setTargetAtTime(
               1.0, audioCtxRef.current.currentTime, 0.05
             );
           }
-          if (ws.readyState === WebSocket.OPEN)
-            ws.send(
-              JSON.stringify({ type: "audio", data: toPCM16b64(audioFloat32) }),
-            );
         },
-
         onVADMisfire: () => {
           // bahut choti noise thi — restore gain and ignore
           setUserSpeaking(false);
@@ -393,7 +390,7 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
       try {
         vadRef.current.pause();
         vadRef.current.destroy?.();
-      } catch {}
+      } catch { }
       vadRef.current = null;
     }
     // Disconnect AudioWorklet node (fallback path)

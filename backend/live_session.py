@@ -101,23 +101,33 @@ Keep each explanation under 30 seconds. Never speak for longer than 30 seconds w
             await self.cleanup()
 
     async def _receive_from_frontend(self):
-        """Receive Mic audio or Text commands from user's browser."""
+        """Receive Mic audio or Text commands from user's browser   ."""
         try:
             while self._running:
                 raw = await self.websocket.receive_text()
                 msg = json.loads(raw)
                 msg_type = msg.get("type")
 
-                if msg_type == "audio":
-                    # Raw PCM 16-bit 24kHz audio from frontend
-                    audio_data = base64.b64decode(msg["data"])
+            if msg_type == "audio":
+                # Raw PCM 16-bit 24kHz audio from frontend
+                audio_data = base64.b64decode(msg["data"])
+                await self.gemini_session.send(
+                    input=types.LiveClientRealtimeInput(
+                        media_chunks=[types.Blob(data=audio_data, mime_type="audio/pcm;rate=24000")]
+                    )
+                )
+            elif msg_type == "interrupt":  # ← YE ADD KARO
+                try:
                     await self.gemini_session.send(
                         input=types.LiveClientRealtimeInput(
-                            media_chunks=[types.Blob(data=audio_data, mime_type="audio/pcm;rate=24000")]
+                            activity_start=types.ActivityStart()
                         )
                     )
-                elif msg_type == "end":
-                    self._running = False
+                    logger.info(f"Barge-in sent: {self.session_id}")
+                except Exception as e:
+                    logger.warning(f"Interrupt failed: {e}")
+            elif msg_type == "end":
+                self._running = False
         except Exception as e:
             logger.error(f"Frontend bridge error: {e}")
             self._running = False
