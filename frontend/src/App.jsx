@@ -1,6 +1,9 @@
+
+
+
 import { useState, useEffect, useRef } from "react";
 
-// ── Backend URL — .env mein set karo ─────────────
+// ── Backend URL — .env  ─────────────
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
 const WS_URL = BACKEND_URL.replace(/^http/, "ws");
 
@@ -34,6 +37,7 @@ const GlobalStyles = () => (
     @keyframes fade-in    { from{opacity:0;transform:translateY(5px)} to{opacity:1;transform:translateY(0)} }
     @keyframes slide-r    { from{opacity:0;transform:translateX(14px)} to{opacity:1;transform:translateX(0)} }
     @keyframes spin       { to{transform:rotate(360deg)} }
+    @keyframes caption-in { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
 
     .hov-card:hover  { transform:translateY(-2px)!important; box-shadow:0 6px 20px rgba(60,62,74,.09)!important; }
     .new-card:hover  { background:${C.garden}!important; border-color:${C.smoke}!important; }
@@ -41,6 +45,9 @@ const GlobalStyles = () => (
     .back-btn:hover  { background:${C.garden}!important; }
     ::-webkit-scrollbar{ width:3px } ::-webkit-scrollbar-track{background:transparent}
     ::-webkit-scrollbar-thumb{background:${C.moss}44;border-radius:10px}
+
+    .transcript-entry { animation: fade-in .3s ease; }
+    .caption-text { animation: caption-in .2s ease; }
   `}</style>
 );
 
@@ -121,7 +128,7 @@ const getSessions = () => {
 
 const saveSession = (files, sessionId) => {
   const iconFor = (name) => {
-    if (name?.match(/\.pdf$/i))   return "📄";
+    if (name?.match(/\.pdf$/i)) return "📄";
     if (name?.match(/\.pptx?$/i)) return "📊";
     if (name?.match(/\.docx?$/i)) return "📝";
     return "📃";
@@ -143,7 +150,7 @@ const saveSession = (files, sessionId) => {
 const timeAgo = (ts) => {
   const diff = Date.now() - ts;
   const m = Math.floor(diff / 60000), h = Math.floor(diff / 3600000), d = Math.floor(diff / 86400000);
-  if (m < 1)  return "just now";
+  if (m < 1) return "just now";
   if (m < 60) return `${m} min ago`;
   if (h < 24) return `${h} hour${h > 1 ? "s" : ""} ago`;
   return `${d} day${d > 1 ? "s" : ""} ago`;
@@ -157,7 +164,14 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
   const [slides, setSlides] = useState(false);
   const [secs, setSecs] = useState(0);
   const [status, setStatus] = useState("connecting");
-  const [transcript, setTranscript] = useState("");
+
+  // ── TRANSCRIPT: full running log ─────────────────
+  // Each entry: { id, speaker: "leksa"|"user", text, time }
+  const [transcriptLog, setTranscriptLog] = useState([]);
+
+  // ── SUBTITLE: only the latest line for live caption ─
+  const [currentSubtitle, setCurrentSubtitle] = useState("");
+
   const [segInfo, setSegInfo] = useState(null);
   const [error, setError] = useState(null);
   const [userSpeaking, setUserSpeaking] = useState(false);
@@ -172,14 +186,34 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
   const vadRef = useRef(null);
   const geminiGainRef = useRef(null);
   const nextStartTimeRef = useRef(0);
+  const transcriptEndRef = useRef(null); // auto-scroll ref
+  const secsRef = useRef(0);
 
   const fmt = (s) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
   useEffect(() => {
-    const t = setInterval(() => setSecs((s) => s + 1), 1000);
+    const t = setInterval(() => {
+      setSecs((s) => { secsRef.current = s + 1; return s + 1; });
+    }, 1000);
     return () => clearInterval(t);
   }, []);
+
+  // ── Helper: add entry to transcript log ──────────
+  const addToLog = (speaker, text) => {
+    if (!text?.trim()) return;
+    setTranscriptLog(prev => [
+      ...prev,
+      { id: Date.now() + Math.random(), speaker, text: text.trim(), time: secsRef.current }
+    ]);
+  };
+
+  // ── Auto-scroll transcript to bottom ─────────────
+  useEffect(() => {
+    if (tab === "Transcript") {
+      transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [transcriptLog, tab]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -190,6 +224,7 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
 
     ws.onmessage = async (event) => {
       const msg = JSON.parse(event.data);
+
       if (msg.type === "audio") {
         const raw = atob(msg.data);
         const bytes = new Uint8Array(raw.length);
@@ -198,22 +233,51 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
         drainAudioQueue();
         setPlaying(true);
       }
-      if (msg.type === "transcript") setTranscript(msg.text);
-      if (msg.type === "segment") setSegInfo({ index: msg.index, title: msg.title, key_points: msg.key_points || [] });
+
+      // ── Leksa (AI) transcript ─────────────────────
+      if (msg.type === "transcript") {
+        setCurrentSubtitle(msg.text);       // live subtitle
+        addToLog("leksa", msg.text);        // append to full log
+      }
+
+      // ── User speech transcript ────────────────────
+      if (msg.type === "user_transcript") {
+        addToLog("user", msg.text);
+      }
+
+      // ── Segment info (key points for Slides panel) ─
+      if (msg.type === "segment") {
+        setSegInfo({
+          index: msg.index,
+          title: msg.title,
+          key_points: msg.key_points || [],
+        });
+      }
+
       if (msg.type === "status") {
         setStatus(msg.status);
         if (msg.status === "listening") setPlaying(false);
-        if (msg.status === "speaking")  setPlaying(true);
+        if (msg.status === "speaking") setPlaying(true);
       }
-      if (msg.type === "done") { setStatus("idle"); setPlaying(false); setTranscript("🎓 Lecture complete! Well done."); }
-      if (msg.type === "error") { setError(msg.message); setStatus("idle"); }
+
+      if (msg.type === "done") {
+        setStatus("idle");
+        setPlaying(false);
+        setCurrentSubtitle("🎓 Lecture complete! Well done.");
+        addToLog("leksa", "🎓 Lecture complete! Well done.");
+      }
+
+      if (msg.type === "error") {
+        setError(msg.message);
+        setStatus("idle");
+      }
     };
 
-    ws.onerror = () => setError("Connection error. Is backend on?");
+    ws.onerror = () => console.error("WebSocket connection error. Is the backend running?");
     ws.onclose = () => { setStatus("idle"); setPlaying(false); };
 
     return () => {
-      try { ws.send(JSON.stringify({ type: "end" })); } catch {}
+      try { ws.send(JSON.stringify({ type: "end" })); } catch { }
       ws.close();
       stopMic();
     };
@@ -317,13 +381,13 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
         source.connect(workletNode);
       } catch (workletErr) {
         console.error("AudioWorklet also failed:", workletErr);
-        setError("Mic access nahi mili. Browser se mic allow karo.");
+        console.error("Mic access denied. Please allow microphone in browser settings.");
       }
     }
   };
 
   const stopMic = () => {
-    if (vadRef.current) { try { vadRef.current.pause(); vadRef.current.destroy?.(); } catch {} vadRef.current = null; }
+    if (vadRef.current) { try { vadRef.current.pause(); vadRef.current.destroy?.(); } catch { } vadRef.current = null; }
     workletNodeRef.current?.disconnect();
     workletNodeRef.current?.port.close?.();
     workletNodeRef.current = null;
@@ -339,132 +403,228 @@ function SessionScreen({ onBack, sessionId, uploadedFiles = [] }) {
   const togglePlay = () => {
     if (!wsRef.current) return;
     if (playing) { wsRef.current.send(JSON.stringify({ type: "pause" })); setPlaying(false); }
-    else          { wsRef.current.send(JSON.stringify({ type: "resume" })); setPlaying(true); }
+    else { wsRef.current.send(JSON.stringify({ type: "resume" })); setPlaying(true); }
   };
 
   const docs = uploadedFiles.map((f) => f.name);
 
+  // ── Render Transcript Panel ───────────────────────
+  const renderTranscriptPanel = () => (
+    <div style={{
+      width: "100%", maxWidth: 600, flex: 1, minHeight: 0,
+      background: C.garden, border: `1px solid ${C.moss}44`,
+      borderRadius: 12, overflow: "hidden", display: "flex", flexDirection: "column",
+    }}>
+      {/* Header */}
+      <div style={{
+        padding: "8px 14px", borderBottom: `1px solid ${C.moss}33`,
+        display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0,
+      }}>
+        <span style={{ fontSize: ".65rem", color: C.moss, fontFamily: "'DM Mono',monospace", letterSpacing: ".08em" }}>
+          FULL TRANSCRIPT
+        </span>
+        <span style={{ fontSize: ".62rem", color: `${C.moss}99`, fontFamily: "'DM Mono',monospace" }}>
+          {transcriptLog.length} entries
+        </span>
+      </div>
+
+      {/* Scrollable log */}
+      <div style={{
+        flex: 1, overflowY: "auto", padding: "10px 14px",
+        display: "flex", flexDirection: "column", gap: 8,
+      }}>
+        {transcriptLog.length === 0 ? (
+          <span style={{ color: C.moss, fontStyle: "italic", fontSize: ".75rem", margin: "auto" }}>
+            Waiting for the lecture to begin…
+          </span>
+        ) : (
+          transcriptLog.map((entry) => (
+            <div key={entry.id} className="transcript-entry" style={{
+              display: "flex", flexDirection: "column", gap: 2,
+              alignItems: entry.speaker === "user" ? "flex-end" : "flex-start",
+            }}>
+              {/* Speaker label + time */}
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{
+                  fontSize: ".58rem", fontFamily: "'DM Mono',monospace",
+                  color: entry.speaker === "leksa" ? C.smoke : "#6bbd6e",
+                  letterSpacing: ".05em",
+                }}>
+                  {entry.speaker === "leksa" ? "🎓 LEKSA" : "🎤 YOU"} · {fmt(entry.time)}
+                </span>
+              </div>
+              {/* Bubble */}
+              <div style={{
+                background: entry.speaker === "leksa" ? C.ivory : `${C.midnight}12`,
+                border: `1px solid ${entry.speaker === "leksa" ? C.moss + "44" : C.midnight + "18"}`,
+                borderRadius: entry.speaker === "leksa" ? "4px 12px 12px 12px" : "12px 4px 12px 12px",
+                padding: "6px 11px", fontSize: ".74rem", color: C.midnight,
+                lineHeight: 1.55, maxWidth: "88%",
+              }}>
+                {entry.text}
+              </div>
+            </div>
+          ))
+        )}
+        {/* Auto-scroll anchor */}
+        <div ref={transcriptEndRef} />
+      </div>
+    </div>
+  );
+
+  // ── Render Subtitle box ───────────────────────────
+  const renderSubtitleBox = () => (
+    <div style={{
+      width: "100%", maxWidth: 600, flexShrink: 0,
+      background: C.garden, border: `1px solid ${C.moss}44`,
+      borderRadius: 12, padding: "9px 16px",
+      fontSize: ".78rem", lineHeight: 1.6, color: C.midnight,
+      minHeight: 62, overflow: "hidden",
+    }}>
+      {currentSubtitle
+        ? <span key={currentSubtitle} className="caption-text">{currentSubtitle}</span>
+        : <span style={{ color: C.moss, fontStyle: "italic" }}>
+          {status === "connecting" ? "Connecting to backend…" : "AI teacher is about to speak…"}
+        </span>
+      }
+    </div>
+  );
+
   return (
-    <div style={{ display:"flex", flexDirection:"column", height:"100vh", overflow:"hidden", background:C.ivory }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden", background: C.ivory }}>
 
       {/* NAV */}
-      <nav style={{ height:54, flexShrink:0, display:"flex", alignItems:"center", justifyContent:"space-between", padding:"0 28px", background:C.ivory, borderBottom:`1px solid ${C.moss}44` }}>
-        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-          <button className="back-btn" onClick={onBack} style={{ width:30, height:30, borderRadius:"50%", border:`1px solid ${C.moss}55`, background:"none", display:"flex", alignItems:"center", justifyContent:"center", color:C.moss, fontSize:".85rem", transition:"background .2s" }}>←</button>
-          <span style={{ fontFamily:"'Instrument Serif',serif", fontSize:"1.1rem", color:C.midnight }}>Leksa</span>
+      <nav style={{ height: 54, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 28px", background: C.ivory, borderBottom: `1px solid ${C.moss}44` }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button className="back-btn" onClick={onBack} style={{ width: 30, height: 30, borderRadius: "50%", border: `1px solid ${C.moss}55`, background: "none", display: "flex", alignItems: "center", justifyContent: "center", color: C.moss, fontSize: ".85rem", transition: "background .2s" }}>←</button>
+          <span style={{ fontFamily: "'Instrument Serif',serif", fontSize: "1.1rem", color: C.midnight }}>Leksa</span>
         </div>
-        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-          <div style={{ display:"flex", alignItems:"center", gap:6, background:C.garden, border:`1px solid ${C.moss}44`, borderRadius:100, padding:"4px 12px", fontSize:".7rem", color:C.smoke, fontFamily:"'DM Mono',monospace" }}>
-            <div style={{ width:5, height:5, borderRadius:"50%", background: status==="speaking" ? "#6bbd6e" : status==="listening" ? "#e0a34a" : C.smoke, animation: status!=="idle" ? "pulse-dot 1.5s ease-in-out infinite" : "none" }}/>
-            {status==="connecting" ? "Connecting…" : status==="speaking" ? "Speaking" : status==="listening" ? "Listening" : "Idle"}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, background: C.garden, border: `1px solid ${C.moss}44`, borderRadius: 100, padding: "4px 12px", fontSize: ".7rem", color: C.smoke, fontFamily: "'DM Mono',monospace" }}>
+            <div style={{ width: 5, height: 5, borderRadius: "50%", background: status === "speaking" ? "#6bbd6e" : status === "listening" ? "#e0a34a" : C.smoke, animation: status !== "idle" ? "pulse-dot 1.5s ease-in-out infinite" : "none" }} />
+            {status === "connecting" ? "Connecting…" : status === "speaking" ? "Speaking" : status === "listening" ? "Listening" : "Idle"}
           </div>
-          <span style={{ fontFamily:"'DM Mono',monospace", fontSize:".75rem", color:C.smoke }}>{fmt(secs)}</span>
-          <div style={{ width:32, height:32, borderRadius:"50%", background:C.midnight, color:C.ivory, display:"flex", alignItems:"center", justifyContent:"center", fontSize:".63rem", fontWeight:500 }}>BD</div>
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: ".75rem", color: C.smoke }}>{fmt(secs)}</span>
+          <div style={{ width: 32, height: 32, borderRadius: "50%", background: C.midnight, color: C.ivory, display: "flex", alignItems: "center", justifyContent: "center", fontSize: ".63rem", fontWeight: 500 }}>BD</div>
         </div>
       </nav>
 
       {/* DOCS BAR */}
-      <div style={{ height:40, flexShrink:0, display:"flex", alignItems:"center", gap:7, padding:"0 28px", background:C.ivory, borderBottom:`1px solid ${C.moss}33`, overflowX:"auto" }}>
+      <div style={{ height: 40, flexShrink: 0, display: "flex", alignItems: "center", gap: 7, padding: "0 28px", background: C.ivory, borderBottom: `1px solid ${C.moss}33`, overflowX: "auto" }}>
         {docs.map((d) => (
-          <div key={d} style={{ background:C.smoke, border:`1px solid ${C.smoke}`, borderRadius:100, padding:"3px 13px", fontSize:".68rem", color:C.midnight, fontFamily:"'DM Mono',monospace", fontWeight:500, whiteSpace:"nowrap" }}>{d}</div>
+          <div key={d} style={{ background: C.smoke, border: `1px solid ${C.smoke}`, borderRadius: 100, padding: "3px 13px", fontSize: ".68rem", color: C.midnight, fontFamily: "'DM Mono',monospace", fontWeight: 500, whiteSpace: "nowrap" }}>{d}</div>
         ))}
         {segInfo && (
-          <div style={{ marginLeft:"auto", fontSize:".68rem", color:C.moss, fontFamily:"'DM Mono',monospace", whiteSpace:"nowrap" }}>
-            Seg {segInfo.index+1} — {segInfo.title}
+          <div style={{ marginLeft: "auto", fontSize: ".68rem", color: C.moss, fontFamily: "'DM Mono',monospace", whiteSpace: "nowrap" }}>
+            Seg {segInfo.index + 1} — {segInfo.title}
           </div>
         )}
       </div>
 
-      {/* ERROR */}
-      {error && (
-        <div style={{ background:"#fde8e8", borderBottom:"1px solid #f5c0c0", padding:"8px 28px", fontSize:".78rem", color:"#c0392b", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-          ⚠️ {error}
-          <button onClick={()=>setError(null)} style={{ background:"none", border:"none", color:"#c0392b", cursor:"pointer" }}>×</button>
-        </div>
-      )}
+      {/* ERROR — suppressed from UI; errors are logged to console */}
 
       {/* BODY */}
-      <div style={{ flex:1, display:"flex", overflow:"hidden", minHeight:0 }}>
-        <div style={{ flex:1, minWidth:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"space-evenly", padding:"8px 24px", overflow:"hidden" }}>
+      <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
+        <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "space-evenly", padding: "8px 24px", overflow: "hidden" }}>
 
           {/* Waveform */}
-          <div style={{ width:"100%", maxWidth:600, height:0, flexGrow:2, minHeight:60, maxHeight:130, borderRadius:14, overflow:"hidden", background:`${C.smoke}0A` }}>
-            <Waveform playing={playing && !intrupt}/>
+          <div style={{ width: "100%", maxWidth: 600, height: 0, flexGrow: 2, minHeight: 60, maxHeight: 130, borderRadius: 14, overflow: "hidden", background: `${C.smoke}0A` }}>
+            <Waveform playing={playing && !intrupt} />
           </div>
 
-          {/* Subtitle/Transcript */}
-          {tab !== "Slides" && (
-            <div style={{ width:"100%", maxWidth:600, flexShrink:0, background:C.garden, border:`1px solid ${C.moss}44`, borderRadius:12, padding:"9px 16px", fontSize:".78rem", lineHeight:1.6, color:C.midnight, height:62, overflow:"hidden", animation:"fade-in .25s ease" }}>
-              {tab==="Subtitles" ? (
-                transcript
-                  ? <span>{transcript}</span>
-                  : <span style={{ color:C.moss, fontStyle:"italic" }}>{status==="connecting" ? "Backend se connect ho raha hai…" : "AI teacher bolne wala hai…"}</span>
-              ) : (
-                <>
-                  <p style={{ color:C.moss, fontSize:".6rem", marginBottom:4, fontFamily:"'DM Mono',monospace", letterSpacing:".08em" }}>TRANSCRIPT</p>
-                  <span style={{ color:C.moss, fontStyle:"italic" }}>{transcript || "Transcript yahan aayega…"}</span>
-                </>
-              )}
-            </div>
-          )}
+          {/* ── Subtitles tab: live caption box ── */}
+          {tab === "Subtitles" && renderSubtitleBox()}
+
+          {/* ── Transcript tab: full scrollable log ── */}
+          {tab === "Transcript" && renderTranscriptPanel()}
 
           {/* Mic */}
-          <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:6, flexShrink:0 }}>
-            <button onClick={doIntrupt} style={{ width:56, height:56, borderRadius:"50%", background: userSpeaking ? "#6bbd6e" : intrupt ? C.smoke : C.midnight, border:"none", color:C.ivory, fontSize:"1.05rem", display:"flex", alignItems:"center", justifyContent:"center", transition:"all .25s ease", boxShadow: userSpeaking ? `0 0 0 7px #6bbd6e33` : intrupt ? `0 0 0 7px ${C.smoke}2A` : "none" }}>🎙</button>
-            <MicBars active={intrupt||userSpeaking} count={11}/>
-            <span style={{ fontSize:".58rem", fontFamily:"'DM Mono',monospace", letterSpacing:".06em", color: userSpeaking ? "#6bbd6e" : C.moss, transition:"color .2s" }}>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, flexShrink: 0 }}>
+            <button onClick={doIntrupt} style={{ width: 56, height: 56, borderRadius: "50%", background: userSpeaking ? "#6bbd6e" : intrupt ? C.smoke : C.midnight, border: "none", color: C.ivory, fontSize: "1.05rem", display: "flex", alignItems: "center", justifyContent: "center", transition: "all .25s ease", boxShadow: userSpeaking ? `0 0 0 7px #6bbd6e33` : intrupt ? `0 0 0 7px ${C.smoke}2A` : "none" }}>🎙</button>
+            <MicBars active={intrupt || userSpeaking} count={11} />
+            <span style={{ fontSize: ".58rem", fontFamily: "'DM Mono',monospace", letterSpacing: ".06em", color: userSpeaking ? "#6bbd6e" : C.moss, transition: "color .2s" }}>
               {!vadReady ? "mic active" : userSpeaking ? "● speaking" : "○ listening for voice"}
             </span>
           </div>
 
           {/* Interrupt */}
-          <button onClick={doIntrupt} style={{ background:intrupt?C.smoke:C.garden, border:`1.5px solid ${intrupt?C.smoke:C.moss}`, borderRadius:100, padding:"7px 20px", fontSize:".76rem", color:intrupt?C.midnight:C.moss, fontWeight:intrupt?500:400, display:"flex", alignItems:"center", gap:8, transition:"all .25s ease", flexShrink:0 }}>
-            {intrupt && <MicBars active count={5}/>}
+          <button onClick={doIntrupt} style={{ background: intrupt ? C.smoke : C.garden, border: `1.5px solid ${intrupt ? C.smoke : C.moss}`, borderRadius: 100, padding: "7px 20px", fontSize: ".76rem", color: intrupt ? C.midnight : C.moss, fontWeight: intrupt ? 500 : 400, display: "flex", alignItems: "center", gap: 8, transition: "all .25s ease", flexShrink: 0 }}>
+            {intrupt && <MicBars active count={5} />}
             {intrupt ? "Listening… speak now" : "Interrupt & Ask"}
           </button>
 
           {/* Controls */}
-          <div style={{ display:"flex", alignItems:"center", gap:14, flexShrink:0 }}>
-            <button onClick={togglePlay} style={{ width:42, height:42, borderRadius:"50%", background:C.midnight, border:"none", color:C.ivory, fontSize:".88rem", display:"flex", alignItems:"center", justifyContent:"center", transition:"transform .2s" }}>{playing?"⏸":"▶"}</button>
-            <button onClick={()=>wsRef.current?.send(JSON.stringify({type:"next"}))} style={{ background:"none", border:"none", color:C.moss, fontSize:".76rem", transition:"color .2s" }}
-              onMouseEnter={e=>e.target.style.color=C.midnight} onMouseLeave={e=>e.target.style.color=C.moss}>Next Segment →</button>
+          <div style={{ display: "flex", alignItems: "center", gap: 14, flexShrink: 0 }}>
+            <button onClick={togglePlay} style={{ width: 42, height: 42, borderRadius: "50%", background: C.midnight, border: "none", color: C.ivory, fontSize: ".88rem", display: "flex", alignItems: "center", justifyContent: "center", transition: "transform .2s" }}>{playing ? "⏸" : "▶"}</button>
+            <button onClick={() => wsRef.current?.send(JSON.stringify({ type: "next" }))} style={{ background: "none", border: "none", color: C.moss, fontSize: ".76rem", transition: "color .2s" }}
+              onMouseEnter={e => e.target.style.color = C.midnight} onMouseLeave={e => e.target.style.color = C.moss}>Next Segment →</button>
           </div>
 
           {/* Tabs */}
-          <div style={{ display:"flex", gap:5, flexShrink:0 }}>
-            {["Subtitles","Transcript","Slides"].map(tb=>{
-              const on = tab===tb;
+          <div style={{ display: "flex", gap: 5, flexShrink: 0 }}>
+            {["Subtitles", "Transcript", "Slides"].map(tb => {
+              const on = tab === tb;
               return (
-                <button key={tb} onClick={()=>{ setTab(tb); if(tb==="Slides") setSlides(v=>!v); }} style={{ background:on?C.smoke:C.garden, border:`1px solid ${on?C.smoke:C.moss+"44"}`, borderRadius:100, padding:"5px 15px", fontSize:".71rem", color:on?C.midnight:C.moss, fontWeight:on?500:400, transition:"all .2s" }}>
-                  {tb}{tb==="Slides"?(slides?" ‹":" ›"):""}
+                <button key={tb} onClick={() => { setTab(tb); if (tb === "Slides") setSlides(v => !v); }} style={{ background: on ? C.smoke : C.garden, border: `1px solid ${on ? C.smoke : C.moss + "44"}`, borderRadius: 100, padding: "5px 15px", fontSize: ".71rem", color: on ? C.midnight : C.moss, fontWeight: on ? 500 : 400, transition: "all .2s" }}>
+                  {tb}{tb === "Slides" ? (slides ? " ‹" : " ›") : ""}
                 </button>
               );
             })}
           </div>
         </div>
 
-        {/* SLIDES PANEL */}
+        {/* ── SLIDES PANEL ─────────────────────────── */}
         {slides && (
-          <div style={{ position:"fixed", right:0, top:0, bottom:0, width:310, background:C.garden, borderLeft:`1px solid ${C.moss}44`, display:"flex", flexDirection:"column", padding:"20px 18px", overflowY:"auto", animation:"slide-r .25s ease", zIndex:50 }}>
-            <p style={{ fontFamily:"'Instrument Serif',serif", fontSize:".95rem", color:C.midnight, marginBottom:14 }}>{segInfo?.title||"Current Slide"}</p>
+          <div style={{ position: "fixed", right: 0, top: 0, bottom: 0, width: 310, background: C.garden, borderLeft: `1px solid ${C.moss}44`, display: "flex", flexDirection: "column", padding: "20px 18px", overflowY: "auto", animation: "slide-r .25s ease", zIndex: 50 }}>
+
+            {/* Close button */}
+            <button onClick={() => setSlides(false)} style={{ position: "absolute", top: 14, right: 14, background: "none", border: "none", color: C.moss, fontSize: "1rem", cursor: "pointer" }}>×</button>
+
+            <p style={{ fontFamily: "'Instrument Serif',serif", fontSize: ".95rem", color: C.midnight, marginBottom: 4 }}>
+              {segInfo?.title || "Current Topic"}
+            </p>
+            <p style={{ fontSize: ".62rem", color: C.moss, fontFamily: "'DM Mono',monospace", marginBottom: 16, letterSpacing: ".06em" }}>
+              KEY POINTS
+            </p>
+
             {segInfo?.key_points?.length > 0 ? (
-              <ul style={{ listStyle:"none", display:"flex", flexDirection:"column", gap:12 }}>
-                {segInfo.key_points.map((kp,i)=>(
-                  <li key={i} style={{ display:"flex", alignItems:"flex-start", gap:8, fontSize:".75rem", lineHeight:1.55, color:C.midnight }}>
-                    <span style={{ width:5, height:5, borderRadius:"50%", flexShrink:0, background:C.midnight, marginTop:5 }}/>
+              <ul style={{ listStyle: "none", display: "flex", flexDirection: "column", gap: 10 }}>
+                {segInfo.key_points.map((kp, i) => (
+                  <li key={i} className="transcript-entry" style={{ display: "flex", alignItems: "flex-start", gap: 9, fontSize: ".75rem", lineHeight: 1.55, color: C.midnight, background: C.ivory, borderRadius: 10, padding: "8px 11px", border: `1px solid ${C.moss}33` }}>
+                    <span style={{ width: 18, height: 18, borderRadius: "50%", flexShrink: 0, background: C.midnight, color: C.ivory, display: "flex", alignItems: "center", justifyContent: "center", fontSize: ".55rem", fontWeight: 600, marginTop: 1 }}>
+                      {i + 1}
+                    </span>
                     {kp}
                   </li>
                 ))}
               </ul>
             ) : (
-              <p style={{ fontSize:".75rem", color:C.moss, fontStyle:"italic", lineHeight:1.6 }}>Key points yahan aayenge jab lecture shuru ho…</p>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, gap: 8 }}>
+                <span style={{ fontSize: "1.5rem" }}>📋</span>
+                <p style={{ fontSize: ".75rem", color: C.moss, fontStyle: "italic", lineHeight: 1.6, textAlign: "center" }}>
+                  Key points will appear as the lecture progresses…
+                </p>
+              </div>
+            )}
+
+            {/* Segment progress dots */}
+            {segInfo && (
+              <div style={{ marginTop: "auto", paddingTop: 20, display: "flex", justifyContent: "center", gap: 6 }}>
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <div key={i} style={{
+                    width: 7, height: 7, borderRadius: "50%",
+                    background: i === segInfo.index ? C.midnight : `${C.moss}44`,
+                    transition: "background .3s",
+                  }} />
+                ))}
+              </div>
             )}
           </div>
         )}
       </div>
 
       {/* Tip */}
-      <div style={{ position:"fixed", bottom:18, right:18, background:C.ivory, border:`1px solid ${C.moss}55`, borderRadius:12, padding:"9px 13px", fontSize:".7rem", color:C.midnight, maxWidth:195, lineHeight:1.55, boxShadow:`0 2px 8px ${C.midnight}0B`, animation:"fade-in 1s ease 2s both", zIndex:100 }}>
+      <div style={{ position: "fixed", bottom: 18, right: 18, background: C.ivory, border: `1px solid ${C.moss}55`, borderRadius: 12, padding: "9px 13px", fontSize: ".7rem", color: C.midnight, maxWidth: 195, lineHeight: 1.55, boxShadow: `0 2px 8px ${C.midnight}0B`, animation: "fade-in 1s ease 2s both", zIndex: 100 }}>
         🔥 <strong>Tip:</strong> Interrupt anytime and ask a question.
       </div>
     </div>
@@ -485,13 +645,13 @@ function UploadModal({ onClose, onStart, hintDoc }) {
   };
 
   const iconFor = (name) => {
-    if (name.match(/\.pdf$/i))   return "📄";
+    if (name.match(/\.pdf$/i)) return "📄";
     if (name.match(/\.pptx?$/i)) return "📊";
     if (name.match(/\.docx?$/i)) return "📝";
     return "📃";
   };
 
-  const fmt = (b) => b < 1024*1024 ? `${(b/1024).toFixed(0)} KB` : `${(b/(1024*1024)).toFixed(1)} MB`;
+  const fmt = (b) => b < 1024 * 1024 ? `${(b / 1024).toFixed(0)} KB` : `${(b / (1024 * 1024)).toFixed(1)} MB`;
 
   const handleStart = async () => {
     if (files.length === 0) return;
@@ -500,72 +660,71 @@ function UploadModal({ onClose, onStart, hintDoc }) {
     try {
       const fd = new FormData();
       fd.append("file", files[0]);
-      const res = await fetch(`${BACKEND_URL}/api/upload`, { method:"POST", body:fd });
-      if (!res.ok) { const e = await res.json(); throw new Error(e.detail||"Upload failed"); }
+      const res = await fetch(`${BACKEND_URL}/api/upload`, { method: "POST", body: fd });
+      if (!res.ok) { const e = await res.json(); throw new Error(e.detail || "Upload failed"); }
       const data = await res.json();
       onStart(files, data.session_id);
     } catch (err) {
-      setUploadErr(err.message || "Upload fail hua. Backend chal raha hai?");
+      setUploadErr(err.message || "Upload failed. Is the backend running?");
     } finally {
       setUploading(false);
     }
   };
 
   return (
-    <div style={{ position:"fixed", inset:0, zIndex:200, background:"rgba(60,62,74,.45)", display:"flex", alignItems:"center", justifyContent:"center", animation:"fade-in .2s ease", padding:"20px" }}
-      onClick={e=>e.target===e.currentTarget&&onClose()}>
-      <div style={{ background:C.ivory, borderRadius:20, width:"min(520px,92vw)", padding:"28px 28px 22px", boxShadow:`0 16px 48px ${C.midnight}22`, animation:"fade-in .25s ease", maxHeight:"90vh", overflowY:"auto" }}>
+    <div style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(60,62,74,.45)", display: "flex", alignItems: "center", justifyContent: "center", animation: "fade-in .2s ease", padding: "20px" }}
+      onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={{ background: C.ivory, borderRadius: 20, width: "min(520px,92vw)", padding: "28px 28px 22px", boxShadow: `0 16px 48px ${C.midnight}22`, animation: "fade-in .25s ease", maxHeight: "90vh", overflowY: "auto" }}>
 
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom: hintDoc ? 12 : 20 }}>
-          <span style={{ fontFamily:"'Instrument Serif',serif", fontSize:"1.1rem", color:C.midnight }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: hintDoc ? 12 : 20 }}>
+          <span style={{ fontFamily: "'Instrument Serif',serif", fontSize: "1.1rem", color: C.midnight }}>
             {hintDoc ? "Re-upload to Continue" : "New Session"}
           </span>
-          <button onClick={onClose} style={{ background:"none", border:"none", color:C.moss, fontSize:"1.1rem", cursor:"pointer" }}>×</button>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: C.moss, fontSize: "1.1rem", cursor: "pointer" }}>×</button>
         </div>
 
-        {/* Resume hint — jab purani session reopen karo */}
         {hintDoc && (
-          <div style={{ background:`${C.smoke}18`, border:`1px solid ${C.moss}55`, borderRadius:10, padding:"10px 14px", marginBottom:16, fontSize:".76rem", color:C.midnight, lineHeight:1.6 }}>
-            <strong>📂 Previous session:</strong> <span style={{ color:C.smoke }}>{hintDoc}</span>
-            <br/>
-            <span style={{ color:C.moss, fontSize:".7rem" }}>Backend sessions expire hoti hain — same file dobara upload karo to continue.</span>
+          <div style={{ background: `${C.smoke}18`, border: `1px solid ${C.moss}55`, borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: ".76rem", color: C.midnight, lineHeight: 1.6 }}>
+            <strong>📂 Previous session:</strong> <span style={{ color: C.smoke }}>{hintDoc}</span>
+            <br />
+            <span style={{ color: C.moss, fontSize: ".7rem" }}>Backend sessions expire — upload the same file again to continue.</span>
           </div>
         )}
 
-        <div onDragOver={e=>{e.preventDefault();setDragging(true);}} onDragLeave={()=>setDragging(false)}
-          onDrop={e=>{e.preventDefault();setDragging(false);addFiles(e.dataTransfer.files);}}
-          onClick={()=>inputRef.current.click()}
-          style={{ border:`1.5px dashed ${dragging?C.smoke:C.moss+"88"}`, borderRadius:14, padding:"28px 20px", textAlign:"center", cursor:"pointer", background:dragging?`${C.smoke}0C`:C.garden, transition:"all .2s ease", marginBottom:16 }}>
-          <div style={{ fontSize:"1.6rem", marginBottom:8 }}>📂</div>
-          <p style={{ fontSize:".82rem", color:C.midnight, marginBottom:4 }}>Drag & drop your documents here</p>
-          <p style={{ fontSize:".72rem", color:C.moss }}>PDF · PPT · DOCX · TXT</p>
-          <input ref={inputRef} type="file" multiple accept=".pdf,.ppt,.pptx,.doc,.docx,.txt" style={{ display:"none" }} onChange={e=>addFiles(e.target.files)}/>
+        <div onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)}
+          onDrop={e => { e.preventDefault(); setDragging(false); addFiles(e.dataTransfer.files); }}
+          onClick={() => inputRef.current.click()}
+          style={{ border: `1.5px dashed ${dragging ? C.smoke : C.moss + "88"}`, borderRadius: 14, padding: "28px 20px", textAlign: "center", cursor: "pointer", background: dragging ? `${C.smoke}0C` : C.garden, transition: "all .2s ease", marginBottom: 16 }}>
+          <div style={{ fontSize: "1.6rem", marginBottom: 8 }}>📂</div>
+          <p style={{ fontSize: ".82rem", color: C.midnight, marginBottom: 4 }}>Drag & drop your documents here</p>
+          <p style={{ fontSize: ".72rem", color: C.moss }}>PDF · PPT · DOCX · TXT</p>
+          <input ref={inputRef} type="file" multiple accept=".pdf,.ppt,.pptx,.doc,.docx,.txt" style={{ display: "none" }} onChange={e => addFiles(e.target.files)} />
         </div>
 
         {files.length > 0 && (
-          <div style={{ display:"flex", flexDirection:"column", gap:7, maxHeight:160, overflowY:"auto", marginBottom:16 }}>
-            {files.map((f,i)=>(
-              <div key={i} style={{ display:"flex", alignItems:"center", gap:10, background:C.garden, borderRadius:10, padding:"8px 12px" }}>
-                <span style={{ fontSize:"1rem" }}>{iconFor(f.name)}</span>
-                <div style={{ flex:1, minWidth:0 }}>
-                  <div style={{ fontSize:".76rem", color:C.midnight, fontWeight:500, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{f.name}</div>
-                  <div style={{ fontSize:".65rem", color:C.moss, fontFamily:"'DM Mono',monospace" }}>{fmt(f.size)}</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 7, maxHeight: 160, overflowY: "auto", marginBottom: 16 }}>
+            {files.map((f, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: C.garden, borderRadius: 10, padding: "8px 12px" }}>
+                <span style={{ fontSize: "1rem" }}>{iconFor(f.name)}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: ".76rem", color: C.midnight, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
+                  <div style={{ fontSize: ".65rem", color: C.moss, fontFamily: "'DM Mono',monospace" }}>{fmt(f.size)}</div>
                 </div>
-                <button onClick={()=>setFiles(prev=>prev.filter((_,j)=>j!==i))} style={{ background:"none", border:"none", color:C.moss, fontSize:".85rem", cursor:"pointer" }}>×</button>
+                <button onClick={() => setFiles(prev => prev.filter((_, j) => j !== i))} style={{ background: "none", border: "none", color: C.moss, fontSize: ".85rem", cursor: "pointer" }}>×</button>
               </div>
             ))}
           </div>
         )}
 
         {uploadErr && (
-          <div style={{ background:"#fde8e8", border:"1px solid #f5c0c0", borderRadius:8, padding:"8px 12px", fontSize:".75rem", color:"#c0392b", marginBottom:12 }}>⚠️ {uploadErr}</div>
+          <div style={{ background: "#fde8e8", border: "1px solid #f5c0c0", borderRadius: 8, padding: "8px 12px", fontSize: ".75rem", color: "#c0392b", marginBottom: 12 }}>⚠️ {uploadErr}</div>
         )}
 
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"flex-end", gap:10 }}>
-          <button onClick={onClose} style={{ background:"none", border:"none", color:C.moss, fontSize:".8rem", cursor:"pointer", padding:"8px 4px" }}>Cancel</button>
-          <button onClick={handleStart} disabled={files.length===0||uploading}
-            style={{ background: files.length>0&&!uploading ? C.midnight : `${C.midnight}55`, color:C.ivory, border:"none", borderRadius:100, padding:"9px 22px", fontSize:".8rem", fontWeight:500, cursor: files.length>0&&!uploading ? "pointer":"not-allowed", transition:"background .2s", display:"flex", alignItems:"center", gap:8 }}>
-            {uploading && <div style={{ width:12, height:12, borderRadius:"50%", border:`2px solid ${C.ivory}44`, borderTopColor:C.ivory, animation:"spin .7s linear infinite" }}/>}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 10 }}>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: C.moss, fontSize: ".8rem", cursor: "pointer", padding: "8px 4px" }}>Cancel</button>
+          <button onClick={handleStart} disabled={files.length === 0 || uploading}
+            style={{ background: files.length > 0 && !uploading ? C.midnight : `${C.midnight}55`, color: C.ivory, border: "none", borderRadius: 100, padding: "9px 22px", fontSize: ".8rem", fontWeight: 500, cursor: files.length > 0 && !uploading ? "pointer" : "not-allowed", transition: "background .2s", display: "flex", alignItems: "center", gap: 8 }}>
+            {uploading && <div style={{ width: 12, height: 12, borderRadius: "50%", border: `2px solid ${C.ivory}44`, borderTopColor: C.ivory, animation: "spin .7s linear infinite" }} />}
             {uploading ? "Processing…" : "Start Lecture →"}
           </button>
         </div>
@@ -577,9 +736,8 @@ function UploadModal({ onClose, onStart, hintDoc }) {
 /* ─── HOME SCREEN ──────────────────────────────── */
 function HomeScreen({ onStart, onResume, resumeDoc, onClearResume }) {
   const [showModal, setShowModal] = useState(false);
-  const [sessions, setSessions]   = useState(() => getSessions());
+  const [sessions, setSessions] = useState(() => getSessions());
 
-  // Jab resume click ho — modal auto khule with hint message
   useEffect(() => {
     if (resumeDoc) setShowModal(true);
   }, [resumeDoc]);
@@ -597,70 +755,90 @@ function HomeScreen({ onStart, onResume, resumeDoc, onClearResume }) {
   };
 
   return (
-    <div style={{ display:"flex", flexDirection:"column", height:"100vh", overflow:"hidden", background:C.ivory }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden", background: C.ivory }}>
 
       {showModal && (
         <UploadModal
           onClose={closeModal}
           onStart={handleStart}
-          hintDoc={resumeDoc} // doc naam hint ke liye modal ko pass karo
+          hintDoc={resumeDoc}
         />
       )}
 
-      <nav style={{ height:60, flexShrink:0, display:"flex", alignItems:"center", justifyContent:"space-between", padding:"0 40px", background:C.ivory, borderBottom:`1px solid ${C.moss}44` }}>
-        <span style={{ fontFamily:"'Instrument Serif',serif", fontSize:"1.2rem", color:C.midnight }}>Leksa</span>
-        <div style={{ width:34, height:34, borderRadius:"50%", background:C.midnight, color:C.ivory, display:"flex", alignItems:"center", justifyContent:"center", fontSize:".65rem", fontWeight:500 }}>BD</div>
+      <nav style={{ height: 60, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 40px", background: C.ivory, borderBottom: `1px solid ${C.moss}44` }}>
+        <span style={{ fontFamily: "'Instrument Serif',serif", fontSize: "1.2rem", color: C.midnight }}>Leksa</span>
+        <div style={{ width: 34, height: 34, borderRadius: "50%", background: C.midnight, color: C.ivory, display: "flex", alignItems: "center", justifyContent: "center", fontSize: ".65rem", fontWeight: 500 }}>BD</div>
       </nav>
 
-      <div style={{ flex:1, overflowY:"auto", padding:"38px 40px 28px" }}>
-        <div style={{ maxWidth:840, margin:"0 auto" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "38px 40px 28px" }}>
+        <div style={{ maxWidth: 840, margin: "0 auto" }}>
 
-          <h1 style={{ fontFamily:"'Instrument Serif',serif", fontSize:"2.3rem", fontWeight:400, color:C.midnight, marginBottom:5, letterSpacing:"-.02em", animation:"fade-in .4s ease" }}>
+          <h1 style={{ fontFamily: "'Instrument Serif',serif", fontSize: "2.3rem", fontWeight: 400, color: C.midnight, marginBottom: 5, letterSpacing: "-.02em", animation: "fade-in .4s ease" }}>
             Good morning, Buddy
           </h1>
-          <p style={{ fontSize:".85rem", color:C.moss, marginBottom:30, fontWeight:300 }}>Ready to continue learning?</p>
+          <p style={{ fontSize: ".85rem", color: C.moss, marginBottom: 30, fontWeight: 300 }}>Ready to continue learning?</p>
 
-          {/* CTA Card */}
-          <div className="hov-card" onClick={()=>setShowModal(true)} style={{ background:C.midnight, borderRadius:18, padding:"22px 26px", marginBottom:32, display:"flex", alignItems:"center", justifyContent:"space-between", cursor:"pointer", transition:"transform .2s ease,box-shadow .2s ease", animation:"fade-in .4s ease .08s both" }}>
+          <div className="hov-card" onClick={() => setShowModal(true)} style={{ background: C.midnight, borderRadius: 18, padding: "22px 26px", marginBottom: 32, display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer", transition: "transform .2s ease,box-shadow .2s ease", animation: "fade-in .4s ease .08s both" }}>
             <div>
-              <div style={{ fontFamily:"'Instrument Serif',serif", fontSize:"1.15rem", color:C.ivory, marginBottom:3 }}>Start New Session</div>
-              <div style={{ fontSize:".76rem", color:`${C.ivory}66`, fontWeight:300 }}>Upload your documents and begin an AI-guided lecture</div>
+              <div style={{ fontFamily: "'Instrument Serif',serif", fontSize: "1.15rem", color: C.ivory, marginBottom: 3 }}>Start New Session</div>
+              <div style={{ fontSize: ".76rem", color: `${C.ivory}66`, fontWeight: 300 }}>Upload your documents and begin an AI-guided lecture</div>
             </div>
-            <button className="begin-btn" style={{ background:C.smoke, color:C.ivory, border:"none", borderRadius:100, padding:"8px 18px", fontSize:".78rem", fontWeight:500, transition:"background .2s", whiteSpace:"nowrap" }}>Begin →</button>
+            <button className="begin-btn" style={{ background: C.smoke, color: C.ivory, border: "none", borderRadius: 100, padding: "8px 18px", fontSize: ".78rem", fontWeight: 500, transition: "background .2s", whiteSpace: "nowrap" }}>Begin →</button>
           </div>
 
-          {/* Recent Sessions */}
-          <p style={{ fontFamily:"'Instrument Serif',serif", fontSize:".98rem", color:C.midnight, marginBottom:14, animation:"fade-in .4s ease .16s both" }}>Recent Sessions</p>
+          <p style={{ fontFamily: "'Instrument Serif',serif", fontSize: ".98rem", color: C.midnight, marginBottom: 14, animation: "fade-in .4s ease .16s both" }}>Recent Sessions</p>
 
           {sessions.length === 0 ? (
-            /* Empty state */
-            <div style={{ background:C.garden, border:`1px solid ${C.moss}33`, borderRadius:16, padding:"32px 28px", display:"flex", alignItems:"center", gap:24, animation:"fade-in .4s ease .22s both" }}>
-              <div style={{ width:48, height:48, borderRadius:"50%", flexShrink:0, background:`${C.moss}22`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:"1.3rem" }}>📖</div>
-              <div style={{ flex:1 }}>
-                <p style={{ fontSize:".88rem", color:C.midnight, fontWeight:500, marginBottom:4 }}>No sessions yet</p>
-                <p style={{ fontSize:".78rem", color:C.moss, lineHeight:1.6 }}>Upload a document above to start your first AI-guided lecture.</p>
+            <div style={{ background: C.garden, border: `1px solid ${C.moss}33`, borderRadius: 16, padding: "32px 28px", display: "flex", alignItems: "center", gap: 24, animation: "fade-in .4s ease .22s both" }}>
+              <div style={{ width: 48, height: 48, borderRadius: "50%", flexShrink: 0, background: `${C.moss}22`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1.3rem" }}>📖</div>
+              <div style={{ flex: 1 }}>
+                <p style={{ fontSize: ".88rem", color: C.midnight, fontWeight: 500, marginBottom: 4 }}>No sessions yet</p>
+                <p style={{ fontSize: ".78rem", color: C.moss, lineHeight: 1.6 }}>Upload a document above to start your first AI-guided lecture.</p>
               </div>
-              <button onClick={()=>setShowModal(true)} style={{ background:C.midnight, color:C.ivory, border:"none", borderRadius:100, padding:"9px 20px", fontSize:".76rem", fontWeight:500, cursor:"pointer", whiteSpace:"nowrap", flexShrink:0, transition:"opacity .2s" }}
-                onMouseEnter={e=>e.currentTarget.style.opacity=".8"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>+ New Session</button>
+              <button onClick={() => setShowModal(true)} style={{ background: C.midnight, color: C.ivory, border: "none", borderRadius: 100, padding: "9px 20px", fontSize: ".76rem", fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, transition: "opacity .2s" }}
+                onMouseEnter={e => e.currentTarget.style.opacity = ".8"} onMouseLeave={e => e.currentTarget.style.opacity = "1"}>+ New Session</button>
             </div>
           ) : (
-            /* Session cards */
-            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))", gap:11, animation:"fade-in .4s ease .22s both" }}>
-              {sessions.map((s,i) => (
-                <div key={s.id||i} className="hov-card" onClick={()=>onResume(s)} style={{ background:C.garden, border:`1px solid ${C.moss}44`, borderRadius:14, padding:"14px 15px 12px", cursor:"pointer", position:"relative", overflow:"hidden", transition:"transform .2s ease,box-shadow .2s ease" }}>
-                  <div style={{ position:"absolute", left:0, top:0, bottom:0, width:3, background:C.smoke, borderRadius:"14px 0 0 14px" }}/>
-                  <div style={{ paddingLeft:9, fontFamily:"'Instrument Serif',serif", fontSize:".85rem", color:C.midnight, marginBottom:8, lineHeight:1.35 }}>{s.title}</div>
-                  <div style={{ display:"inline-flex", alignItems:"center", gap:4, background:C.ivory, border:`1px solid ${C.moss}44`, borderRadius:100, padding:"2px 9px", fontSize:".62rem", color:C.moss, marginLeft:9, marginBottom:9 }}>{s.icon} {s.doc}</div>
-                  <div style={{ height:3, background:`${C.moss}40`, borderRadius:100, margin:"0 9px 8px", overflow:"hidden" }}>
-                    <div style={{ height:"100%", width:`${s.progress||5}%`, background:C.smoke, borderRadius:100 }}/>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(220px,1fr))", gap: 11, animation: "fade-in .4s ease .22s both" }}>
+              {sessions.map((s, i) => (
+                <div key={s.id || i} className="hov-card" onClick={() => onResume(s)} style={{ background: C.garden, border: `1px solid ${C.moss}44`, borderRadius: 14, padding: "14px 15px 12px", cursor: "pointer", position: "relative", overflow: "hidden", transition: "transform .2s ease,box-shadow .2s ease" }}>
+
+                  <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: 3, background: C.smoke, borderRadius: "14px 0 0 14px" }} />
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      e.preventDefault();
+                      const updated = sessions.filter((sess) => sess.id !== s.id);
+                      setSessions(updated);
+                      localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+                    }}
+                    style={{
+                      position: "absolute", top: 7, right: 7,
+                      width: 26, height: 26,
+                      borderRadius: "50%",
+                      background: `${C.moss}33`,
+                      border: `1.5px solid ${C.moss}66`,
+                      color: C.midnight, fontSize: "1rem", fontWeight: 700,
+                      cursor: "pointer", lineHeight: 1,
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      padding: 0,
+                      zIndex: 10, opacity: 0.5,
+                      transition: "opacity .15s, background .15s",
+                    }}
+                    onMouseEnter={e => { e.currentTarget.style.opacity = "1"; e.currentTarget.style.background = `${C.moss}66`; }}
+                    onMouseLeave={e => { e.currentTarget.style.opacity = "0.5"; e.currentTarget.style.background = `${C.moss}33`; }}
+                  >×</button>
+                  <div style={{ paddingLeft: 9, fontFamily: "'Instrument Serif',serif", fontSize: ".85rem", color: C.midnight, marginBottom: 8, lineHeight: 1.35 }}>{s.title}</div>
+                  <div style={{ display: "inline-flex", alignItems: "center", gap: 4, background: C.ivory, border: `1px solid ${C.moss}44`, borderRadius: 100, padding: "2px 9px", fontSize: ".62rem", color: C.moss, marginLeft: 9, marginBottom: 9 }}>{s.icon} {s.doc}</div>
+                  <div style={{ height: 3, background: `${C.moss}40`, borderRadius: 100, margin: "0 9px 8px", overflow: "hidden" }}>
+                    <div style={{ height: "100%", width: `${s.progress || 5}%`, background: C.smoke, borderRadius: 100 }} />
                   </div>
-                  <div style={{ fontSize:".62rem", color:C.moss, paddingLeft:9, fontFamily:"'DM Mono',monospace" }}>{timeAgo(s.timestamp)}</div>
+                  <div style={{ fontSize: ".62rem", color: C.moss, paddingLeft: 9, fontFamily: "'DM Mono',monospace" }}>{timeAgo(s.timestamp)}</div>
                 </div>
               ))}
-              {/* New session dashed card */}
-              <div className="new-card" onClick={()=>setShowModal(true)} style={{ background:"transparent", border:`1.5px dashed ${C.moss}66`, borderRadius:14, padding:"14px", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", cursor:"pointer", minHeight:118, gap:8, transition:"all .2s ease" }}>
-                <div style={{ width:30, height:30, borderRadius:"50%", border:`1.5px solid ${C.moss}66`, display:"flex", alignItems:"center", justifyContent:"center", color:C.moss, fontSize:".9rem" }}>+</div>
-                <span style={{ fontSize:".73rem", color:C.moss }}>New Session</span>
+              <div className="new-card" onClick={() => setShowModal(true)} style={{ background: "transparent", border: `1.5px dashed ${C.moss}66`, borderRadius: 14, padding: "14px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", minHeight: 118, gap: 8, transition: "all .2s ease" }}>
+                <div style={{ width: 30, height: 30, borderRadius: "50%", border: `1.5px solid ${C.moss}66`, display: "flex", alignItems: "center", justifyContent: "center", color: C.moss, fontSize: ".9rem" }}>+</div>
+                <span style={{ fontSize: ".73rem", color: C.moss }}>New Session</span>
               </div>
             </div>
           )}
@@ -673,10 +851,10 @@ function HomeScreen({ onStart, onResume, resumeDoc, onClearResume }) {
 /* ─── ROOT ─────────────────────────────────────── */
 export default function App() {
   useEffect(() => { injectFonts(); }, []);
-  const [screen,    setScreen]    = useState("home");
-  const [files,     setFiles]     = useState([]);
+  const [screen, setScreen] = useState("home");
+  const [files, setFiles] = useState([]);
   const [sessionId, setSessionId] = useState(null);
-  const [resumeSession, setResumeSession] = useState(null); // purani session info
+  const [resumeSession, setResumeSession] = useState(null);
 
   const handleStart = (uploadedFiles, sid) => {
     setFiles(uploadedFiles);
@@ -685,10 +863,8 @@ export default function App() {
     setScreen("session");
   };
 
-  // Purani session click — modal open karo same doc naam hint ke saath
-  // Backend session expire hota hai, isliye fresh upload zaroor hai
   const handleResume = (session) => {
-    setResumeSession(session); // modal mein ye pass hoga
+    setResumeSession(session);
   };
 
   return (
@@ -696,16 +872,16 @@ export default function App() {
       <GlobalStyles />
       {screen === "home"
         ? <HomeScreen
-            onStart={handleStart}
-            onResume={handleResume}
-            resumeDoc={resumeSession?.doc || null}
-            onClearResume={() => setResumeSession(null)}
-          />
+          onStart={handleStart}
+          onResume={handleResume}
+          resumeDoc={resumeSession?.doc || null}
+          onClearResume={() => setResumeSession(null)}
+        />
         : <SessionScreen
-            onBack={() => { setScreen("home"); setSessionId(null); }}
-            sessionId={sessionId}
-            uploadedFiles={files}
-          />
+          onBack={() => { setScreen("home"); setSessionId(null); }}
+          sessionId={sessionId}
+          uploadedFiles={files}
+        />
       }
     </>
   );
